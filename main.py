@@ -30,6 +30,7 @@ GEOFENCE_RADIUS_M = 2000           # raio da cerca em metros (2 km)
 ROUTE_MAX_POINTS = 500             # limitar tamanho da rota no mapa
 SPEED_HISTORY_MAX = 600            # ~5min em 0.5s
 MAP_REFRESH_MIN_S = 1.0            # intervalo mínimo entre regenerações do mapa
+MAP_MIN_MOVE_M = 3.0               # deslocamento mínimo para atualizar o mapa
 CSV_FLUSH_INTERVAL_S = 5.0         # flush do CSV a cada 5s
 CSV_BUFFER_MAX = 100               # ou quando atingir 100 pontos
 LOG_ERRORS = False                 # habilitar logs simples de erros
@@ -107,6 +108,10 @@ def salvar_ponto_csv(lat, lon, t, spd, filename="route_history.csv"):
 # Mapa (Folium)
 # =========================
 def gerar_mapa(lat, lon, route_points=None, center=GEOFENCE_CENTER, radius_m=GEOFENCE_RADIUS_M):
+    try:
+        os.environ["FOLIUM_USE_CDN"] = "false"
+    except Exception:
+        pass
     m = folium.Map(location=[lat, lon], zoom_start=16, tiles="CartoDB positron")
     # Geofence (círculo leve)
     folium.Circle(
@@ -220,11 +225,11 @@ class MainWindow(QMainWindow):
         ports_row.addWidget(self.port_combo, 1)
         ports_row.addWidget(self.btn_refresh_ports)
 
-        btn_connect = QPushButton("Conectar")
-        btn_connect.clicked.connect(self.conectar)
+        self.btn_connect = QPushButton("Conectar")
+        self.btn_connect.clicked.connect(self.conectar)
 
-        btn_disconnect = QPushButton("Desconectar")
-        btn_disconnect.clicked.connect(self.desconectar)
+        self.btn_disconnect = QPushButton("Desconectar")
+        self.btn_disconnect.clicked.connect(self.desconectar)
 
         # Simulação (novo botão)
         self.btn_simulate = QPushButton("Iniciar simulação")
@@ -264,8 +269,8 @@ class MainWindow(QMainWindow):
         # Organização painel lateral
         side.addWidget(title)
         side.addLayout(ports_row)
-        side.addWidget(btn_connect)
-        side.addWidget(btn_disconnect)
+        side.addWidget(self.btn_connect)
+        side.addWidget(self.btn_disconnect)
         side.addWidget(self.btn_simulate)  # adiciona botão de simulação
         side.addWidget(self.btn_follow)    # adiciona botão seguir mapa
         side.addWidget(self.btn_save)      # adiciona botão salvar rota
@@ -330,9 +335,16 @@ class MainWindow(QMainWindow):
         self.sim_radius_m = 40.0
         self.sim_speed_target_kmh = 20.0
         self.sim_last_time = time.time()
+        self.last_reconnect_attempt = 0.0
 
         # Inicializa lista de portas
         self.refresh_ports()
+
+        # Estados iniciais dos botões e arquivo CSV da sessão
+        self._update_buttons()
+        self.csv_filename = f"route_history_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        self.last_map_pos = None
+        self.offline_assets_ok = self._check_leaflet_assets()
 
     # ----- Conexão -----
     def conectar(self):
@@ -359,8 +371,10 @@ class MainWindow(QMainWindow):
                 self.serial_stop.clear()
                 self.serial_thread = SerialReader(self.arduino, self.serial_queue, self.serial_stop)
                 self.serial_thread.start()
+            self._update_buttons()
         else:
             self.status_label.setText("❌ Nenhum Arduino encontrado")
+            self._update_buttons()
 
     def desconectar(self):
         # para thread e fecha serial
@@ -389,6 +403,7 @@ class MainWindow(QMainWindow):
                 print(f"[erro] esvaziar fila: {e}")
             pass
         self.status_label.setText("🔴 Desconectado")
+        self._update_buttons()
 
     # ----- Salvamento de rota -----
     def toggle_save(self):
@@ -428,92 +443,105 @@ class MainWindow(QMainWindow):
 
     # ----- Loop principal -----
     def tick(self):
-        # lê linha da queue (preenchida pela SerialReader) — não bloqueante
-        linha = None
-        if self.arduino:
-            try:
-                linha = self.serial_queue.get_nowait()
-            except queue.Empty:
-                linha = None
-        now = time.time()
-        if (not linha) and self.simulating:
-            linha = self.gerar_leitura_simulada(now)
-
-        lat, lon, spd = None, None, None
-
-        if linha:
-            # Formato esperado: LAT:...,LON:...,SPD:...
-            if linha.startswith("LAT:") and "LON:" in linha:
+        try:
+            # lê linha da queue (preenchida pela SerialReader) — não bloqueante
+            linha = None
+            if self.arduino:
                 try:
-                    parts = linha.split(",")
-                    lat = float(parts[0].split(":")[1])
-                    lon = float(parts[1].split(":")[1])
-                    if len(parts) > 2 and "SPD:" in parts[2]:
-                        spd = float(parts[2].split(":")[1])
+                    linha = self.serial_queue.get_nowait()
+                except queue.Empty:
+                    linha = None
+            now = time.time()
+
+            # tentativa de reconexão automática quando desconectado
+            if (self.arduino is None) and (now - self.last_reconnect_attempt > 5.0) and (not self.simulating):
+                self.last_reconnect_attempt = now
+                try:
+                    self.conectar()
                 except Exception as e:
                     if LOG_ERRORS:
-                        print(f"[erro] parse linha: '{linha}' -> {e}")
+                        print(f"[erro] reconectar: {e}")
 
-        # Se não veio velocidade, estima pela distância entre pontos
-        if lat is not None and lon is not None:
-            if self.last_point:
-                lat0, lon0, t0 = self.last_point
-                dt = max(1e-6, now - t0)
-                dist_m = haversine_m(lat0, lon0, lat, lon)
-                est_kmh = (dist_m / dt) * 3.6
-                if spd is None:
-                    spd = est_kmh
+            if (not linha) and self.simulating:
+                linha = self.gerar_leitura_simulada(now)
 
-                # Detecta movimento
-                if dist_m > 1.5:  # moveu mais que 1.5 m entre leituras
+            lat, lon, spd = None, None, None
+
+            if linha:
+                # Formato esperado: LAT:...,LON:...,SPD:...
+                if linha.startswith("LAT:") and "LON:" in linha:
+                    try:
+                        parts = linha.split(",")
+                        lat = float(parts[0].split(":")[1])
+                        lon = float(parts[1].split(":")[1])
+                        if len(parts) > 2 and "SPD:" in parts[2]:
+                            spd = float(parts[2].split(":")[1])
+                    except Exception as e:
+                        if LOG_ERRORS:
+                            print(f"[erro] parse linha: '{linha}' -> {e}")
+
+            # Se não veio velocidade, estima pela distância entre pontos
+            if lat is not None and lon is not None:
+                if self.last_point:
+                    lat0, lon0, t0 = self.last_point
+                    dt = max(1e-6, now - t0)
+                    dist_m = haversine_m(lat0, lon0, lat, lon)
+                    est_kmh = (dist_m / dt) * 3.6
+                    if spd is None:
+                        spd = est_kmh
+
+                    # Detecta movimento
+                    if dist_m > 1.5:  # moveu mais que 1.5 m entre leituras
+                        self.last_movement_time = now
+                else:
+                    # primeiro ponto
                     self.last_movement_time = now
+
+                self.last_point = (lat, lon, now)
+                self.pos_label.setText(f"Lat: {lat:.5f} | Lon: {lon:.5f}")
+
+                # Atualiza rota
+                self.route.append((lat, lon))
+                # Bufferiza CSV se habilitado
+                if self.save_route:
+                    self.csv_buffer.append((lat, lon, now, spd))
+                self._flush_csv_if_needed(now)
+
+                # Atualiza mapa com limitação de frequência
+                if self.follow_map and self._should_refresh_map(now) and self._moved_enough(lat, lon):
+                    self._refresh_map(lat, lon)
+
+            # Velocidade e gráfico
+            if spd is not None:
+                self.spd_label.setText(f"Velocidade: {spd:.1f} km/h")
+                t_rel = now - self.t0
+                self.speed_history.append((t_rel, spd))
+                xs = [p[0] for p in self.speed_history]
+                ys = [p[1] for p in self.speed_history]
+                self.speed_curve.setData(xs, ys)
+
+            # Alertas
+            alerts = []
+            # Parado por muito tempo
+            if now - self.last_movement_time > STOP_ALERT_SECONDS:
+                alerts.append(f"Parado há {int(now - self.last_movement_time)}s")
+
+            # Fora da geofence
+            if self.last_point:
+                if not dentro_da_geofence(self.last_point[0], self.last_point[1]):
+                    alerts.append("Fora da área segura")
+
+            # Atualiza label de alertas com cores dependendo da gravidade
+            if alerts:
+                color = "#ff6b6b" if any("Fora" in a for a in alerts) else ("#ffb74d" if any("Parado" in a for a in alerts) else "#ffd166")
+                self.alert_label.setStyleSheet(f"color: {color}; font-weight: 700;")
+                self.alert_label.setText("Alertas: " + "; ".join(alerts))
             else:
-                # primeiro ponto
-                self.last_movement_time = now
-
-            self.last_point = (lat, lon, now)
-            self.pos_label.setText(f"Lat: {lat:.5f} | Lon: {lon:.5f}")
-
-            # Atualiza rota
-            self.route.append((lat, lon))
-            # Bufferiza CSV se habilitado
-            if self.save_route:
-                self.csv_buffer.append((lat, lon, now, spd))
-            self._flush_csv_if_needed(now)
-
-            # Atualiza mapa com limitação de frequência
-            if self.follow_map and self._should_refresh_map(now):
-                self._refresh_map(lat, lon)
-
-        # Velocidade e gráfico
-        if spd is not None:
-            self.spd_label.setText(f"Velocidade: {spd:.1f} km/h")
-            t_rel = now - self.t0
-            self.speed_history.append((t_rel, spd))
-            xs = [p[0] for p in self.speed_history]
-            ys = [p[1] for p in self.speed_history]
-            self.speed_curve.setData(xs, ys)
-
-        # Alertas
-        alerts = []
-        # Parado por muito tempo
-        if now - self.last_movement_time > STOP_ALERT_SECONDS:
-            alerts.append(f"Parado há {int(now - self.last_movement_time)}s")
-
-        # Fora da geofence
-        if self.last_point:
-            if not dentro_da_geofence(self.last_point[0], self.last_point[1]):
-                alerts.append("Fora da área segura")
-
-        # Atualiza label de alertas com cores dependendo da gravidade
-        if alerts:
-            # cor vermelha se contém "Fora", laranja se só parado, caso contrário amarelo
-            color = "#ff6b6b" if any("Fora" in a for a in alerts) else ("#ffb74d" if any("Parado" in a for a in alerts) else "#ffd166")
-            self.alert_label.setStyleSheet(f"color: {color}; font-weight: 700;")
-            self.alert_label.setText("Alertas: " + "; ".join(alerts))
-        else:
-            self.alert_label.setStyleSheet("color: #8ee3a9;")
-            self.alert_label.setText("Alertas: OK")
+                self.alert_label.setStyleSheet("color: #8ee3a9;")
+                self.alert_label.setText("Alertas: OK")
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] tick: {e}")
 
     def _should_refresh_map(self, now_ts):
         return (now_ts - self.last_map_update) >= MAP_REFRESH_MIN_S
@@ -521,11 +549,61 @@ class MainWindow(QMainWindow):
     def _refresh_map(self, lat, lon):
         try:
             gerar_mapa(lat, lon, list(self.route))
+            # tenta converter o mapa para modo offline se os assets existirem
+            try:
+                self._try_make_map_offline("mapa.html")
+            except Exception as e:
+                if LOG_ERRORS:
+                    print(f"[erro] offline map rewrite: {e}")
             self.webview.load(QUrl.fromLocalFile(os.path.abspath("mapa.html")))
             self.last_map_update = time.time()
+            self.last_map_pos = (lat, lon)
         except Exception as e:
             if LOG_ERRORS:
                 print(f"[erro] refresh map: {e}")
+
+    def _moved_enough(self, lat, lon):
+        if not self.last_map_pos:
+            return True
+        try:
+            d = haversine_m(self.last_map_pos[0], self.last_map_pos[1], lat, lon)
+            return d >= MAP_MIN_MOVE_M
+        except Exception:
+            return True
+
+    def _check_leaflet_assets(self):
+        try:
+            js_ok = os.path.exists(os.path.join("assets", "leaflet", "leaflet.js"))
+            css_ok = os.path.exists(os.path.join("assets", "leaflet", "leaflet.css"))
+            return js_ok and css_ok
+        except Exception:
+            return False
+
+    def _try_make_map_offline(self, html_path):
+        if not self._check_leaflet_assets():
+            # avisa na UI que está sem assets locais
+            self.alert_label.setText("Alertas: assets Leaflet locais ausentes (modo online)")
+            self.alert_label.setStyleSheet("color: #ffd166; font-weight: 700;")
+            return False
+        try:
+            with open(html_path, "r", encoding="utf-8") as f:
+                html = f.read()
+            # substitui referências ao Leaflet por caminhos locais
+            html = html.replace(
+                "https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js",
+                "assets/leaflet/leaflet.js"
+            )
+            html = html.replace(
+                "https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css",
+                "assets/leaflet/leaflet.css"
+            )
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            return True
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] reescrever mapa offline: {e}")
+            return False
 
     def _flush_csv_if_needed(self, now_ts):
         if not self.csv_buffer:
@@ -533,7 +611,7 @@ class MainWindow(QMainWindow):
         if (now_ts - self.csv_last_flush) >= CSV_FLUSH_INTERVAL_S or len(self.csv_buffer) >= CSV_BUFFER_MAX:
             try:
                 for lat, lon, t, spd in self.csv_buffer:
-                    salvar_ponto_csv(lat, lon, t, spd)
+                    salvar_ponto_csv(lat, lon, t, spd, filename=self.csv_filename)
             except Exception as e:
                 if LOG_ERRORS:
                     print(f"[erro] flush csv: {e}")
@@ -549,6 +627,7 @@ class MainWindow(QMainWindow):
         if self.simulating:
             # reset pequeno para evitar saltos
             self.sim_angle = 0.0
+        self._update_buttons()
 
     def gerar_leitura_simulada(self, now):
         dt = max(1e-6, now - self.sim_last_time)
@@ -582,6 +661,17 @@ class MainWindow(QMainWindow):
         if self.follow_map and self.last_point:
             lat, lon, _ = self.last_point
             self._refresh_map(lat, lon)
+
+    def _update_buttons(self):
+        is_connected = self.arduino is not None
+        # Conexão
+        try:
+            self.btn_connect.setEnabled(not is_connected)
+            self.btn_disconnect.setEnabled(is_connected)
+            self.port_combo.setEnabled(not is_connected)
+            self.btn_refresh_ports.setEnabled(not is_connected)
+        except Exception:
+            pass
 
     # ----- Encerramento -----
     def closeEvent(self, event):
@@ -746,196 +836,6 @@ def create_app_icon_pixmap(size: int = 128) -> QPixmap:
 
     p.end()
     return pm
-
-    # ----- Loop principal -----
-    def tick(self):
-        # lê linha da queue (preenchida pela SerialReader) — não bloqueante
-        linha = None
-        if self.arduino:
-            try:
-                linha = self.serial_queue.get_nowait()
-            except queue.Empty:
-                linha = None
-        now = time.time()
-        if (not linha) and self.simulating:
-            linha = self.gerar_leitura_simulada(now)
-
-        lat, lon, spd = None, None, None
-
-        if linha:
-            # Formato esperado: LAT:...,LON:...,SPD:...
-            if linha.startswith("LAT:") and "LON:" in linha:
-                try:
-                    parts = linha.split(",")
-                    lat = float(parts[0].split(":")[1])
-                    lon = float(parts[1].split(":")[1])
-                    if len(parts) > 2 and "SPD:" in parts[2]:
-                        spd = float(parts[2].split(":")[1])
-                except Exception as e:
-                    if LOG_ERRORS:
-                        print(f"[erro] parse linha: '{linha}' -> {e}")
-
-        # Se não veio velocidade, estima pela distância entre pontos
-        if lat is not None and lon is not None:
-            if self.last_point:
-                lat0, lon0, t0 = self.last_point
-                dt = max(1e-6, now - t0)
-                dist_m = haversine_m(lat0, lon0, lat, lon)
-                est_kmh = (dist_m / dt) * 3.6
-                if spd is None:
-                    spd = est_kmh
-
-                # Detecta movimento
-                if dist_m > 1.5:  # moveu mais que 1.5 m entre leituras
-                    self.last_movement_time = now
-            else:
-                # primeiro ponto
-                self.last_movement_time = now
-
-            self.last_point = (lat, lon, now)
-            self.pos_label.setText(f"Lat: {lat:.5f} | Lon: {lon:.5f}")
-
-            # Atualiza rota
-            self.route.append((lat, lon))
-            # Bufferiza CSV se habilitado
-            if self.save_route:
-                self.csv_buffer.append((lat, lon, now, spd))
-            self._flush_csv_if_needed(now)
-
-            # Atualiza mapa com limitação de frequência
-            if self.follow_map and self._should_refresh_map(now):
-                self._refresh_map(lat, lon)
-
-        # Velocidade e gráfico
-        if spd is not None:
-            self.spd_label.setText(f"Velocidade: {spd:.1f} km/h")
-            t_rel = now - self.t0
-            self.speed_history.append((t_rel, spd))
-            xs = [p[0] for p in self.speed_history]
-            ys = [p[1] for p in self.speed_history]
-            self.speed_curve.setData(xs, ys)
-
-        # Alertas
-        alerts = []
-        # Parado por muito tempo
-        if now - self.last_movement_time > STOP_ALERT_SECONDS:
-            alerts.append(f"Parado há {int(now - self.last_movement_time)}s")
-
-        # Fora da geofence
-        if self.last_point:
-            if not dentro_da_geofence(self.last_point[0], self.last_point[1]):
-                alerts.append("Fora da área segura")
-
-        # Atualiza label de alertas com cores dependendo da gravidade
-        if alerts:
-            # cor vermelha se contém "Fora", laranja se só parado, caso contrário amarelo
-            color = "#ff6b6b" if any("Fora" in a for a in alerts) else ("#ffb74d" if any("Parado" in a for a in alerts) else "#ffd166")
-            self.alert_label.setStyleSheet(f"color: {color}; font-weight: 700;")
-            self.alert_label.setText("Alertas: " + "; ".join(alerts))
-        else:
-            self.alert_label.setStyleSheet("color: #8ee3a9;")
-            self.alert_label.setText("Alertas: OK")
-
-    def _should_refresh_map(self, now_ts):
-        return (now_ts - self.last_map_update) >= MAP_REFRESH_MIN_S
-
-    def _refresh_map(self, lat, lon):
-        try:
-            gerar_mapa(lat, lon, list(self.route))
-            self.webview.load(QUrl.fromLocalFile(os.path.abspath("mapa.html")))
-            self.last_map_update = time.time()
-        except Exception as e:
-            if LOG_ERRORS:
-                print(f"[erro] refresh map: {e}")
-
-    def _flush_csv_if_needed(self, now_ts):
-        if not self.csv_buffer:
-            return
-        if (now_ts - self.csv_last_flush) >= CSV_FLUSH_INTERVAL_S or len(self.csv_buffer) >= CSV_BUFFER_MAX:
-            try:
-                for lat, lon, t, spd in self.csv_buffer:
-                    salvar_ponto_csv(lat, lon, t, spd)
-            except Exception as e:
-                if LOG_ERRORS:
-                    print(f"[erro] flush csv: {e}")
-            finally:
-                self.csv_buffer.clear()
-                self.csv_last_flush = now_ts
-
-    # ----- Simulação -----
-    def toggle_simulation(self):
-        self.simulating = not self.simulating
-        self.sim_last_time = time.time()
-        self.btn_simulate.setText("Parar simulação" if self.simulating else "Iniciar simulação")
-        if self.simulating:
-            # reset pequeno para evitar saltos
-            self.sim_angle = 0.0
-
-    def gerar_leitura_simulada(self, now):
-        dt = max(1e-6, now - self.sim_last_time)
-        self.sim_last_time = now
-        # avança ângulo (rad/s)
-        self.sim_angle += 0.8 * dt
-
-        # posição ao redor do centro (círculo pequeno)
-        ang = self.sim_angle
-        dx = math.cos(ang) * self.sim_radius_m
-        dy = math.sin(ang) * self.sim_radius_m
-
-        center_lat, center_lon = self.sim_center
-        # conversão aproximada metros -> graus
-        dlat = dy / 111320.0
-        dlon = dx / (111320.0 * math.cos(math.radians(center_lat)) + 1e-12)
-
-        lat = center_lat + dlat
-        lon = center_lon + dlon
-
-        # velocidade simulada varia com o ângulo (apenas para visualização)
-        spd = self.sim_speed_target_kmh * (0.6 + 0.4 * math.sin(ang))
-
-        return f"LAT:{lat:.6f},LON:{lon:.6f},SPD:{spd:.2f}"
-
-    # ----- Seguir mapa -----
-    def toggle_follow(self):
-        self.follow_map = not self.follow_map
-        self.btn_follow.setText("Seguir mapa: ON" if self.follow_map else "Seguir mapa: OFF")
-        # se acabou de ativar, atualiza o mapa uma vez imediatamente
-        if self.follow_map and self.last_point:
-            lat, lon, _ = self.last_point
-            self._refresh_map(lat, lon)
-
-    # ----- Encerramento -----
-    def closeEvent(self, event):
-        # salvar rota final se habilitado
-        if self.save_route and self.route:
-            now = time.time()
-            for idx, (lat, lon) in enumerate(self.route):
-                t = now - (len(self.route) - idx)
-                # empilha restante no buffer
-                self.csv_buffer.append((lat, lon, t, None))
-        # flush final de CSV
-        try:
-            self._flush_csv_if_needed(time.time() + CSV_FLUSH_INTERVAL_S)
-        except Exception as e:
-            if LOG_ERRORS:
-                print(f"[erro] flush final csv: {e}")
-        # parar thread serial e fechar porta
-        try:
-            self.serial_stop.set()
-            if self.serial_thread and self.serial_thread.is_alive():
-                self.serial_thread.join(timeout=1.0)
-        except Exception as e:
-            if LOG_ERRORS:
-                print(f"[erro] finalizar thread serial: {e}")
-            pass
-        if self.arduino:
-            try:
-                self.arduino.close()
-            except Exception as e:
-                if LOG_ERRORS:
-                    print(f"[erro] fechar serial no closeEvent: {e}")
-                pass
-        super().closeEvent(event)
 #
 # =========================
 # Execução
