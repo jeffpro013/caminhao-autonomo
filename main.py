@@ -1,5 +1,9 @@
-import sys, os, time, math
-import threading, queue
+import sys
+import os
+import time
+import math
+import threading
+import queue
 import serial
 import serial.tools.list_ports
 import folium
@@ -11,7 +15,6 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QTimer, QUrl, Qt, QRectF
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QLinearGradient, QBrush, QPen
-# Import seguro para QWebEngineSettings (fallback)
 from PySide6.QtWebEngineWidgets import QWebEngineView
 try:
     from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -23,44 +26,41 @@ from collections import deque
 import csv
 from pathlib import Path
 import re
+import json
 
 # =========================
-# Configurações #essa lisa e muito linda 
+# Configurações
 # =========================
 START_LAT = -19.92
 START_LON = -43.94
 UPDATE_MS = 500
-STOP_ALERT_SECONDS = 30            # alerta se ficar parado por mais de 30s
-GEOFENCE_CENTER = (-19.92, -43.94) # centro da cerca (BH como exemplo)
-GEOFENCE_RADIUS_M = 2000           # raio da cerca em metros (2 km)
-ROUTE_MAX_POINTS = 500             # limitar tamanho da rota no mapa
-SPEED_HISTORY_MAX = 600            # ~5min em 0.5s
-MAP_REFRESH_MIN_S = 1.0            # intervalo mínimo entre regenerações do mapa
-MAP_MIN_MOVE_M = 3.0               # deslocamento mínimo para atualizar o mapa
-CSV_FLUSH_INTERVAL_S = 5.0         # flush do CSV a cada 5s
-CSV_BUFFER_MAX = 100               # ou quando atingir 100 pontos
-LOG_ERRORS = False                 # habilitar logs simples de erros
+STOP_ALERT_SECONDS = 30
+GEOFENCE_CENTER = (-19.92, -43.94)
+GEOFENCE_RADIUS_M = 2000
+ROUTE_MAX_POINTS = 500
+SPEED_HISTORY_MAX = 600
+MAP_REFRESH_MIN_S = 1.0
+MAP_MIN_MOVE_M = 3.0
+CSV_FLUSH_INTERVAL_S = 5.0
+CSV_BUFFER_MAX = 100
+LOG_ERRORS = False
 
 APP_TITLE = "🚛 Caminhão Autônomo - Painel de Controle"
 SPLASH_DEV_NAME = "Jefferson"
 SPLASH_PROJECT_NAME = "Caminhão Autônomo"
 
-# Mantém referência global para a janela principal
 _MAIN_WINDOW_REF = None
 
 # =========================
 # Utilitários
 # =========================
 def detectar_porta():
-    # tentativa robusta: primeiro tenta heurística por descrição/nome, se nada
-    # retorna a primeira porta disponível (ou None se não houver nenhuma).
     portas = list(serial.tools.list_ports.comports())
     for porta in portas:
         desc = (getattr(porta, "description", "") or "").lower()
         name = (getattr(porta, "name", "") or "").lower()
         if any(k in desc for k in ["arduino", "ch340", "usb serial"]) or any(k in name for k in ["ttyusb", "com", "usb"]):
             return porta.device
-    # fallback: retorna a primeira porta encontrada
     if portas:
         return getattr(portas[0], "device", None) or getattr(portas[0], "name", None)
     return None
@@ -80,18 +80,18 @@ def conectar_arduino(port_override=None):
 def ler_linha_serial(ser):
     if ser:
         try:
-            # usar readline mesmo que in_waiting seja 0 (drivers/timeout podem variar)
             linha = ser.readline()
             if not linha:
                 return None
             return linha.decode("utf-8", errors="ignore").strip()
-        except:
+        except Exception:
             return None
     return None
 
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
-    phi1 = math.radians(lat1); phi2 = math.radians(lat2)
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
@@ -115,9 +115,8 @@ def salvar_ponto_csv(lat, lon, t, spd, filename="route_history.csv"):
             print(f"[erro] salvar_ponto_csv: {e}")
 
 # =========================
-# Mapa (Folium)
+# Mapa (helpers)
 # =========================
-# novo: provedores de tiles (aprx. "Waze" visual usando Carto Voyager)
 TILE_PROVIDERS = {
     "voyager": {
         "url": "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
@@ -134,9 +133,7 @@ TILE_PROVIDERS = {
 }
 
 def _asset_file_url(rel_path: str) -> str:
-    # retorna URL file:/// absoluto com barras corretas para uso em HTML
-    abs_p = os.path.abspath(rel_path)
-    abs_p = abs_p.replace("\\", "/")
+    abs_p = os.path.abspath(rel_path).replace("\\", "/")
     return f"file:///{abs_p}"
 
 def gerar_mapa(lat, lon, route_points=None, center=GEOFENCE_CENTER, radius_m=GEOFENCE_RADIUS_M, theme="voyager"):
@@ -180,27 +177,41 @@ def gerar_mapa(lat, lon, route_points=None, center=GEOFENCE_CENTER, radius_m=GEO
 <div id="map"></div>
 <script src="{leaflet_js}"></script>
 <script>
-var map = L.map('map').setView([{lat:.6f},{lon:.6f}], 16);
+/* Inicializa mapa centrado nas coordenadas padrão */
+var DEFAULT_LAT = {lat:.6f}, DEFAULT_LON = {lon:.6f};
+var map = L.map('map').setView([DEFAULT_LAT, DEFAULT_LON], 16);
 L.tileLayer('{tile_url}', {{ attribution: '{tile_attr}', maxZoom: 19 }}).addTo(map);
 L.circle([{center[0]:.6f},{center[1]:.6f}], {{ radius: {int(radius_m)}, color: '#ff5c5c', weight: 2, fill: true, fillOpacity: 0.04 }}).addTo(map);
-L.circleMarker([{lat:.6f},{lon:.6f}], {{ radius: 8, color: '#0066cc', fill: true, fillColor: '#00aaff', fillOpacity: 0.9 }}).addTo(map);
+var currentMarker = L.circleMarker([{lat:.6f},{lon:.6f}], {{ radius: 8, color: '#0066cc', fill: true, fillColor: '#00aaff', fillOpacity: 0.9 }}).addTo(map);
+var routeLine = null;
 var route = {rp_js};
 if (route.length > 1) {{
-    L.polyline(route, {{ color: 'blue', weight: 4, opacity: 0.8 }}).addTo(map);
-    map.fitBounds(L.polyline(route).getBounds(), {{padding: [50,50]}});
+    routeLine = L.polyline(route, {{ color: 'blue', weight: 4, opacity: 0.8 }}).addTo(map);
+    try {{ map.fitBounds(routeLine.getBounds(), {{padding: [50,50]}}); }} catch(e){{}}
+}}
+
+/* updateData function (used by Python runJavaScript) */
+function updateData(lat, lon, route) {{
+    try {{
+        if (typeof lat !== 'number' || typeof lon !== 'number') return;
+        if (currentMarker) currentMarker.setLatLng([lat, lon]); else currentMarker = L.circleMarker([lat, lon]).addTo(map);
+        if (Array.isArray(route) && route.length > 0) {{
+            if (routeLine) routeLine.setLatLngs(route);
+            else routeLine = L.polyline(route, {{ color: 'blue', weight: 4, opacity: 0.8 }}).addTo(map);
+            if (route.length > 1) try {{ map.fitBounds(routeLine.getBounds(), {{padding: [50,50]}}); }} catch(e){{}}
+        }} else {{
+            try {{ map.panTo([lat, lon]); }} catch(e){{}}
+        }}
+    }} catch(err) {{ console.error('updateData error', err); }}
 }}
 </script>
 </body>
 </html>"""
-
-        # salva arquivo final (mapa.html)
         with open("mapa.html", "w", encoding="utf-8") as f:
             f.write(html)
-
     except Exception as e:
         if LOG_ERRORS:
             print(f"[erro] gerar_mapa (fallback): {e}")
-        # fallback mínimo
         try:
             with open("mapa.html", "w", encoding="utf-8") as f:
                 f.write(f"<html><body><p>Erro ao gerar mapa: {e}</p></body></html>")
@@ -208,11 +219,6 @@ if (route.length > 1) {{
             pass
 
 def rewrite_map_html_offline(html_path):
-    """
-    Substitui referências ao Leaflet CDN por assets locais se existirem.
-    Usa URLs absolutos file:/// para assets locais (melhora compatibilidade com QWebEngineView).
-    Retorna True se reescreveu, False caso não haja assets locais ou erro.
-    """
     try:
         js_local_p = os.path.join("assets", "leaflet", "leaflet.js")
         css_local_p = os.path.join("assets", "leaflet", "leaflet.css")
@@ -220,22 +226,14 @@ def rewrite_map_html_offline(html_path):
         css_local = os.path.exists(css_local_p)
         if not (js_local and css_local):
             return False
-
-        # URLs absolutos file:///
         js_file_url = _asset_file_url(js_local_p)
         css_file_url = _asset_file_url(css_local_p)
-
         with open(html_path, "r", encoding="utf-8") as f:
             html = f.read()
-
-        # substitui URLs .js/.css que contenham 'leaflet' por assets locais (arquivo absoluto)
         html = re.sub(r'https?://[^"\'>]*leaflet[^"\'>]*\.js', js_file_url, html, flags=re.IGNORECASE)
         html = re.sub(r'https?://[^"\'>]*leaflet[^"\'>]*\.css', css_file_url, html, flags=re.IGNORECASE)
-
-        # substitui eventuais referências relativas por caminho absoluto
         html = html.replace('assets/leaflet/leaflet.js', js_file_url)
         html = html.replace('assets/leaflet/leaflet.css', css_file_url)
-
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html)
         if LOG_ERRORS:
@@ -286,6 +284,51 @@ class SerialReader(threading.Thread):
                 time.sleep(0.1)
 
 class MainWindow(QMainWindow):
+    def _file_url_with_ts(self, rel_path: str) -> QUrl:
+        """Retorna QUrl file:/// absoluto com timestamp para evitar cache do WebEngineView."""
+        abs_p = os.path.abspath(rel_path).replace("\\", "/")
+        return QUrl(f"file:///{abs_p}?t={int(time.time()*1000)}")
+
+    def _update_map_dynamic(self, lat: float, lon: float):
+        """
+        Tenta atualizar o mapa no WebEngine via JavaScript chamando updateData(lat, lon, route).
+        Retorna True se enfileirou/executou com sucesso, False caso não.
+        """
+        try:
+            # prepara rota como lista Python
+            route_list = list(self.route)
+            # se página ainda não carregou, guarda o update para executar depois (fila)
+            if not getattr(self, "map_ready", False):
+                # cap da fila para evitar crescimento ilimitado
+                try:
+                    if len(self._pending_map_updates) >= 1000:
+                        # descarta o mais antigo para abrir espaço
+                        self._pending_map_updates.popleft()
+                except Exception:
+                    pass
+                self._pending_map_updates.append((lat, lon, route_list))
+                return False
+
+            # serializa e chama JS
+            route_json = json.dumps(route_list)
+            js = f"try {{ updateData({lat:.6f}, {lon:.6f}, {route_json}); }} catch(e) {{ console.error('updateData error', e); }}"
+            try:
+                self.webview.page().runJavaScript(js)
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _check_leaflet_assets(self):
+        """Verifica se existem assets locais do Leaflet (JS/CSS)."""
+        try:
+            js_ok = os.path.exists(os.path.join("assets", "leaflet", "leaflet.js"))
+            css_ok = os.path.exists(os.path.join("assets", "leaflet", "leaflet.css"))
+            return js_ok and css_ok
+        except Exception:
+            return False
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
@@ -401,6 +444,11 @@ class MainWindow(QMainWindow):
         # Painel do mapa
         self.webview = QWebEngineView()
 
+        # controle para saber quando a página do mapa está pronta para receber JS
+        self.map_ready = False
+        # fila de updates pendentes (lat, lon, route_list)
+        self._pending_map_updates = deque()
+
         # configurações importantes para permitir que HTML local acesse arquivos locais/remotos
         try:
             settings = self.webview.settings()
@@ -410,7 +458,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # conectar sinal de carregamento para debug
+        # conectar signal de carregamento para debug e para marcar page pronta
         try:
             self.webview.loadFinished.connect(self._on_map_load_finished)
         except Exception:
@@ -434,7 +482,7 @@ class MainWindow(QMainWindow):
             rewrite_map_html_offline("mapa.html")
         except Exception:
             pass
-        self.webview.load(QUrl.fromLocalFile(os.path.abspath("mapa.html")))
+        self.webview.load(self._file_url_with_ts("mapa.html"))
 
         # Layout principal
         root.addLayout(side, 2)
@@ -694,40 +742,30 @@ class MainWindow(QMainWindow):
         return (now_ts - self.last_map_update) >= MAP_REFRESH_MIN_S
 
     def _refresh_map(self, lat, lon):
+        # tenta atualizar dinamicamente via JS (mais rápido e confiável)
+        try:
+            ok = self._update_map_dynamic(lat, lon)
+            if ok:
+                self.last_map_update = time.time()
+                self.last_map_pos = (lat, lon)
+                return
+        except Exception:
+            pass
+
+        # fallback: regenerar HTML e recarregar (mantido para compatibilidade)
         try:
             gerar_mapa(lat, lon, list(self.route))
-            # tenta converter o mapa para modo offline se os assets existirem
             try:
                 self._try_make_map_offline("mapa.html")
             except Exception as e:
                 if LOG_ERRORS:
                     print(f"[erro] offline map rewrite: {e}")
-            self.webview.load(QUrl.fromLocalFile(os.path.abspath("mapa.html")))
+            self.webview.load(self._file_url_with_ts("mapa.html"))
             self.last_map_update = time.time()
             self.last_map_pos = (lat, lon)
         except Exception as e:
             if LOG_ERRORS:
                 print(f"[erro] refresh map: {e}")
-
-    def _moved_enough(self, lat, lon):
-        if not self.last_map_pos:
-            return True
-        try:
-            d = haversine_m(self.last_map_pos[0], self.last_map_pos[1], lat, lon)
-            return d >= MAP_MIN_MOVE_M
-        except Exception:
-            return True
-
-    def _check_leaflet_assets(self):
-        try:
-            js_ok = os.path.exists(os.path.join("assets", "leaflet", "leaflet.js"))
-            css_ok = os.path.exists(os.path.join("assets", "leaflet", "leaflet.css"))
-            return js_ok and css_ok
-        except Exception:
-            return False
-
-    def _try_make_map_offline(self, html_path):
-        return rewrite_map_html_offline(html_path)
 
     def reload_map(self):
         """Regenera mapa com o tema selecionado e recarrega o WebView."""
@@ -738,10 +776,19 @@ class MainWindow(QMainWindow):
                 rewrite_map_html_offline("mapa.html")
             except Exception:
                 pass
-            self.webview.load(QUrl.fromLocalFile(os.path.abspath("mapa.html")))
-            self._log(f"reload_map: regenerated mapa.html with theme={self.map_theme}")
+            # tenta usar atualização dinâmica se disponível
+            if not self._update_map_dynamic(START_LAT, START_LON):
+                # força recarregamento evitando cache
+                self.webview.load(self._file_url_with_ts("mapa.html"))
+            try:
+                self._log(f"reload_map: regenerated mapa.html with theme={self.map_theme}")
+            except Exception:
+                pass
         except Exception as e:
-            self._log(f"reload_map error: {e}")
+            try:
+                self._log(f"reload_map error: {e}")
+            except Exception:
+                pass
 
     def open_map_external(self):
         """Abre mapa.html no navegador externo (útil para debug)."""
@@ -866,9 +913,33 @@ class MainWindow(QMainWindow):
     def _on_map_load_finished(self, ok: bool):
         try:
             if ok:
+                self.map_ready = True
+                # drena e aplica todos os updates pendentes (se houver)
+                try:
+                    while self._pending_map_updates:
+                        item = self._pending_map_updates.popleft()
+                        try:
+                            lat, lon, route_list = item
+                            route_json = json.dumps(route_list)
+                            js = f"try {{ updateData({lat:.6f}, {lon:.6f}, {route_json}); }} catch(e) {{ console.error('updateData error', e); }}"
+                            try:
+                                self.webview.page().runJavaScript(js)
+                            except Exception:
+                                # se falhar, re-enfileira e sai (será tentado no próximo load)
+                                self._pending_map_updates.appendleft(item)
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    # qualquer erro ao drenar não deve travar a UI
+                    pass
+                # se havia um update pendente, executa agora
+                # antigo campo _pending_map_update removido (usamos fila)
+
                 self.status_label.setText("✅ Mapa carregado")
                 self._log("mapa.html carregado com sucesso no QWebEngineView")
             else:
+                self.map_ready = False
                 self.status_label.setText("❌ Erro ao carregar mapa")
                 self._log("falha ao carregar mapa.html no QWebEngineView")
                 # abre no navegador externo para ajudar no debug
@@ -886,9 +957,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-
 # =========================
-# Splash Screen com cometa
+# Splash Screen e execução
 # =========================
 class SplashScreen(QWidget):
     def __init__(self, developer_name: str, project_name: str, width: int = 720, height: int = 420):

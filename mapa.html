@@ -10,14 +10,32 @@
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
 <script>
-var map = L.map('map').setView([-19.920000,-43.940000], 16);
+/* Inicializa mapa centrado nas coordenadas padrão */
+var DEFAULT_LAT = -19.920000, DEFAULT_LON = -43.940000;
+var map = L.map('map').setView([DEFAULT_LAT, DEFAULT_LON], 16);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', { attribution: '&copy; <a href=\'https://carto.com/\'>CARTO</a> &mdash; Dados: OSM', maxZoom: 19 }).addTo(map);
 L.circle([-19.920000,-43.940000], { radius: 2000, color: '#ff5c5c', weight: 2, fill: true, fillOpacity: 0.04 }).addTo(map);
-L.circleMarker([-19.920000,-43.940000], { radius: 8, color: '#0066cc', fill: true, fillColor: '#00aaff', fillOpacity: 0.9 }).addTo(map);
+var currentMarker = L.circleMarker([-19.920000,-43.940000], { radius: 8, color: '#0066cc', fill: true, fillColor: '#00aaff', fillOpacity: 0.9 }).addTo(map);
+var routeLine = null;
 var route = [];
 if (route.length > 1) {
-    L.polyline(route, { color: 'blue', weight: 4, opacity: 0.8 }).addTo(map);
-    map.fitBounds(L.polyline(route).getBounds(), {padding: [50,50]});
+    routeLine = L.polyline(route, { color: 'blue', weight: 4, opacity: 0.8 }).addTo(map);
+    try { map.fitBounds(routeLine.getBounds(), {padding: [50,50]}); } catch(e){}
+}
+
+/* updateData function (used by Python runJavaScript) */
+function updateData(lat, lon, route) {
+    try {
+        if (typeof lat !== 'number' || typeof lon !== 'number') return;
+        if (currentMarker) currentMarker.setLatLng([lat, lon]); else currentMarker = L.circleMarker([lat, lon]).addTo(map);
+        if (Array.isArray(route) && route.length > 0) {
+            if (routeLine) routeLine.setLatLngs(route);
+            else routeLine = L.polyline(route, { color: 'blue', weight: 4, opacity: 0.8 }).addTo(map);
+            if (route.length > 1) try { map.fitBounds(routeLine.getBounds(), {padding: [50,50]}); } catch(e){}
+        } else {
+            try { map.panTo([lat, lon]); } catch(e){}
+        }
+    } catch(err) { console.error('updateData error', err); }
 }
 </script>
 </body>
