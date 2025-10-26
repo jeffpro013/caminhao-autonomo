@@ -11,12 +11,18 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QTimer, QUrl, Qt, QRectF
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QLinearGradient, QBrush, QPen
+# Import seguro para QWebEngineSettings (fallback)
 from PySide6.QtWebEngineWidgets import QWebEngineView
+try:
+    from PySide6.QtWebEngineCore import QWebEngineSettings
+except Exception:
+    QWebEngineSettings = None
 
 import pyqtgraph as pg
 from collections import deque
 import csv
 from pathlib import Path
+import re
 
 # =========================
 # Configurações #essa lisa e muito linda 
@@ -46,13 +52,17 @@ _MAIN_WINDOW_REF = None
 # Utilitários
 # =========================
 def detectar_porta():
-    portas = serial.tools.list_ports.comports()
+    # tentativa robusta: primeiro tenta heurística por descrição/nome, se nada
+    # retorna a primeira porta disponível (ou None se não houver nenhuma).
+    portas = list(serial.tools.list_ports.comports())
     for porta in portas:
         desc = (getattr(porta, "description", "") or "").lower()
         name = (getattr(porta, "name", "") or "").lower()
-        # aceita descrições e nomes comuns de portas USB/Arduino
         if any(k in desc for k in ["arduino", "ch340", "usb serial"]) or any(k in name for k in ["ttyusb", "com", "usb"]):
             return porta.device
+    # fallback: retorna a primeira porta encontrada
+    if portas:
+        return getattr(portas[0], "device", None) or getattr(portas[0], "name", None)
     return None
 
 def conectar_arduino(port_override=None):
@@ -107,39 +117,134 @@ def salvar_ponto_csv(lat, lon, t, spd, filename="route_history.csv"):
 # =========================
 # Mapa (Folium)
 # =========================
-def gerar_mapa(lat, lon, route_points=None, center=GEOFENCE_CENTER, radius_m=GEOFENCE_RADIUS_M):
+# novo: provedores de tiles (aprx. "Waze" visual usando Carto Voyager)
+TILE_PROVIDERS = {
+    "voyager": {
+        "url": "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+        "attr": "&copy; <a href='https://carto.com/'>CARTO</a> &mdash; Dados: OSM"
+    },
+    "osm": {
+        "url": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "attr": "&copy; OpenStreetMap contributors"
+    },
+    "positron": {
+        "url": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        "attr": "&copy; CARTO"
+    }
+}
+
+def _asset_file_url(rel_path: str) -> str:
+    # retorna URL file:/// absoluto com barras corretas para uso em HTML
+    abs_p = os.path.abspath(rel_path)
+    abs_p = abs_p.replace("\\", "/")
+    return f"file:///{abs_p}"
+
+def gerar_mapa(lat, lon, route_points=None, center=GEOFENCE_CENTER, radius_m=GEOFENCE_RADIUS_M, theme="voyager"):
+    """
+    Gera um mapa HTML standalone usando Leaflet. Se assets/leaflet existir usa os arquivos locais,
+    caso contrário usa CDN. Desenha geofence, marcador atual e rota (se houver).
+    """
     try:
-        os.environ["FOLIUM_USE_CDN"] = "false"
-    except Exception:
-        pass
-    m = folium.Map(location=[lat, lon], zoom_start=16, tiles="CartoDB positron")
-    # Geofence (círculo leve)
-    folium.Circle(
-        location=[center[0], center[1]],
-        radius=radius_m,
-        color="#ff5c5c",
-        weight=2,
-        fill=True,
-        fill_opacity=0.04,
-        tooltip="Geofence"
-    ).add_to(m)
+        # escolhe Leaflet (local ou CDN)
+        local_js = os.path.exists(os.path.join("assets", "leaflet", "leaflet.js"))
+        local_css = os.path.exists(os.path.join("assets", "leaflet", "leaflet.css"))
+        if local_js and local_css:
+            leaflet_js = _asset_file_url(os.path.join("assets", "leaflet", "leaflet.js"))
+            leaflet_css = _asset_file_url(os.path.join("assets", "leaflet", "leaflet.css"))
+        else:
+            # CDN fallback (útil em ambiente com internet)
+            leaflet_js = "https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"
+            leaflet_css = "https://unpkg.com/leaflet@1.9.3/dist/leaflet.css"
 
-    # Marcador da posição atual mais visível
-    folium.CircleMarker(
-        location=[lat, lon],
-        radius=8,
-        color="#0066cc",
-        fill=True,
-        fill_color="#00aaff",
-        fill_opacity=0.9,
-        tooltip=f"Lat:{lat:.5f} Lon:{lon:.5f}"
-    ).add_to(m)
+        # provider de tiles
+        prov = TILE_PROVIDERS.get(theme, TILE_PROVIDERS["voyager"])
+        tile_url = prov["url"]
+        tile_attr = prov.get("attr", "").replace("'", "\\'")
 
-    if route_points and len(route_points) > 1:
-        # Desenha a rota (polilinha azul)
-        PolyLine(route_points, color="blue", weight=4, opacity=0.8).add_to(m)
+        # converte pontos de rota para JS
+        if route_points:
+            rp_js = "[" + ",".join(f"[{p[0]:.6f},{p[1]:.6f}]" for p in route_points) + "]"
+        else:
+            rp_js = "[]"
 
-    m.save("mapa.html")
+        # monta HTML seguro (usar {{ }} para chaves literais no f-string)
+        html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<link rel="stylesheet" href="{leaflet_css}"/>
+<style>html,body,#map{{height:100%;margin:0;padding:0}}</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="{leaflet_js}"></script>
+<script>
+var map = L.map('map').setView([{lat:.6f},{lon:.6f}], 16);
+L.tileLayer('{tile_url}', {{ attribution: '{tile_attr}', maxZoom: 19 }}).addTo(map);
+L.circle([{center[0]:.6f},{center[1]:.6f}], {{ radius: {int(radius_m)}, color: '#ff5c5c', weight: 2, fill: true, fillOpacity: 0.04 }}).addTo(map);
+L.circleMarker([{lat:.6f},{lon:.6f}], {{ radius: 8, color: '#0066cc', fill: true, fillColor: '#00aaff', fillOpacity: 0.9 }}).addTo(map);
+var route = {rp_js};
+if (route.length > 1) {{
+    L.polyline(route, {{ color: 'blue', weight: 4, opacity: 0.8 }}).addTo(map);
+    map.fitBounds(L.polyline(route).getBounds(), {{padding: [50,50]}});
+}}
+</script>
+</body>
+</html>"""
+
+        # salva arquivo final (mapa.html)
+        with open("mapa.html", "w", encoding="utf-8") as f:
+            f.write(html)
+
+    except Exception as e:
+        if LOG_ERRORS:
+            print(f"[erro] gerar_mapa (fallback): {e}")
+        # fallback mínimo
+        try:
+            with open("mapa.html", "w", encoding="utf-8") as f:
+                f.write(f"<html><body><p>Erro ao gerar mapa: {e}</p></body></html>")
+        except Exception:
+            pass
+
+def rewrite_map_html_offline(html_path):
+    """
+    Substitui referências ao Leaflet CDN por assets locais se existirem.
+    Usa URLs absolutos file:/// para assets locais (melhora compatibilidade com QWebEngineView).
+    Retorna True se reescreveu, False caso não haja assets locais ou erro.
+    """
+    try:
+        js_local_p = os.path.join("assets", "leaflet", "leaflet.js")
+        css_local_p = os.path.join("assets", "leaflet", "leaflet.css")
+        js_local = os.path.exists(js_local_p)
+        css_local = os.path.exists(css_local_p)
+        if not (js_local and css_local):
+            return False
+
+        # URLs absolutos file:///
+        js_file_url = _asset_file_url(js_local_p)
+        css_file_url = _asset_file_url(css_local_p)
+
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+
+        # substitui URLs .js/.css que contenham 'leaflet' por assets locais (arquivo absoluto)
+        html = re.sub(r'https?://[^"\'>]*leaflet[^"\'>]*\.js', js_file_url, html, flags=re.IGNORECASE)
+        html = re.sub(r'https?://[^"\'>]*leaflet[^"\'>]*\.css', css_file_url, html, flags=re.IGNORECASE)
+
+        # substitui eventuais referências relativas por caminho absoluto
+        html = html.replace('assets/leaflet/leaflet.js', js_file_url)
+        html = html.replace('assets/leaflet/leaflet.css', css_file_url)
+
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        if LOG_ERRORS:
+            print(f"[debug] rewrite_map_html_offline: rewrote {html_path} to use local leaflet assets")
+        return True
+    except Exception as e:
+        if LOG_ERRORS:
+            print(f"[erro] rewrite_map_html_offline: {e}")
+        return False
 
 # =========================
 # Interface
@@ -153,23 +258,31 @@ class SerialReader(threading.Thread):
         self.stop_event = stop_event
 
     def run(self):
+        # leitura robusta da serial, checa is_open, trata exceções e evita busy-loop
         while not self.stop_event.is_set():
             try:
-                linha = self.ser.readline()
-                if not linha:
-                    continue
+                if not self.ser or (hasattr(self.ser, "is_open") and not getattr(self.ser, "is_open")):
+                    # porta fechada: sair
+                    break
+                # tenta ler linha com timeout já configurado no objeto serial
+                linha = None
                 try:
-                    s = linha.decode("utf-8", errors="ignore").strip()
+                    raw = self.ser.readline()
+                    if raw:
+                        linha = raw.decode("utf-8", errors="ignore").strip()
                 except Exception as e:
                     if LOG_ERRORS:
-                        print(f"[erro] decode serial: {e}")
-                    s = None
-                if s:
-                    self.q.put(s)
+                        print(f"[erro] leitura serial (raw): {e}")
+                    linha = None
+
+                if linha:
+                    self.q.put(linha)
+                else:
+                    # evita tight-loop quando nada lido
+                    time.sleep(0.01)
             except Exception as e:
-                # em caso de erro com serial, evita tight-loop
                 if LOG_ERRORS:
-                    print(f"[erro] leitura serial: {e}")
+                    print(f"[erro] leitura serial (thread): {e}")
                 time.sleep(0.1)
 
 class MainWindow(QMainWindow):
@@ -287,7 +400,40 @@ class MainWindow(QMainWindow):
 
         # Painel do mapa
         self.webview = QWebEngineView()
-        gerar_mapa(START_LAT, START_LON, [])
+
+        # configurações importantes para permitir que HTML local acesse arquivos locais/remotos
+        try:
+            settings = self.webview.settings()
+            if QWebEngineSettings is not None:
+                settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+                settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+        except Exception:
+            pass
+
+        # conectar sinal de carregamento para debug
+        try:
+            self.webview.loadFinished.connect(self._on_map_load_finished)
+        except Exception:
+            pass
+
+        # controles do mapa: tema, recarregar, abrir externo (adicionados ao painel lateral)
+        self.map_theme = "voyager"
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["voyager", "positron", "osm"])
+        self.btn_reload_map = QPushButton("Recarregar mapa")
+        self.btn_reload_map.clicked.connect(self.reload_map)
+        self.btn_open_map = QPushButton("Abrir mapa (navegador)")
+        self.btn_open_map.clicked.connect(self.open_map_external)
+        side.addWidget(self.theme_combo)
+        side.addWidget(self.btn_reload_map)
+        side.addWidget(self.btn_open_map)
+
+        # gera e carrega mapa.html
+        gerar_mapa(START_LAT, START_LON, [], theme=self.map_theme)
+        try:
+            rewrite_map_html_offline("mapa.html")
+        except Exception:
+            pass
         self.webview.load(QUrl.fromLocalFile(os.path.abspath("mapa.html")))
 
         # Layout principal
@@ -430,11 +576,12 @@ class MainWindow(QMainWindow):
             if items:
                 self.port_combo.addItems(items)
             else:
-                self.port_combo.addItem("")
+                # evita adicionar string vazia que causa parsing problemático
+                self.port_combo.addItem("(nenhuma porta detectada)")
         except Exception as e:
             if LOG_ERRORS:
                 print(f"[erro] listar portas: {e}")
-            self.port_combo.addItem("")
+            self.port_combo.addItem("(erro listar portas)")
 
     def toggle_logs(self):
         global LOG_ERRORS
@@ -580,30 +727,30 @@ class MainWindow(QMainWindow):
             return False
 
     def _try_make_map_offline(self, html_path):
-        if not self._check_leaflet_assets():
-            # avisa na UI que está sem assets locais
-            self.alert_label.setText("Alertas: assets Leaflet locais ausentes (modo online)")
-            self.alert_label.setStyleSheet("color: #ffd166; font-weight: 700;")
-            return False
+        return rewrite_map_html_offline(html_path)
+
+    def reload_map(self):
+        """Regenera mapa com o tema selecionado e recarrega o WebView."""
         try:
-            with open(html_path, "r", encoding="utf-8") as f:
-                html = f.read()
-            # substitui referências ao Leaflet por caminhos locais
-            html = html.replace(
-                "https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js",
-                "assets/leaflet/leaflet.js"
-            )
-            html = html.replace(
-                "https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css",
-                "assets/leaflet/leaflet.css"
-            )
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            return True
+            self.map_theme = self.theme_combo.currentText() or "voyager"
+            gerar_mapa(START_LAT, START_LON, list(self.route), theme=self.map_theme)
+            try:
+                rewrite_map_html_offline("mapa.html")
+            except Exception:
+                pass
+            self.webview.load(QUrl.fromLocalFile(os.path.abspath("mapa.html")))
+            self._log(f"reload_map: regenerated mapa.html with theme={self.map_theme}")
         except Exception as e:
-            if LOG_ERRORS:
-                print(f"[erro] reescrever mapa offline: {e}")
-            return False
+            self._log(f"reload_map error: {e}")
+
+    def open_map_external(self):
+        """Abre mapa.html no navegador externo (útil para debug)."""
+        try:
+            import webbrowser
+            webbrowser.open('file://' + os.path.abspath('mapa.html'))
+            self._log("open_map_external: opened mapa.html in external browser")
+        except Exception as e:
+            self._log(f"open_map_external error: {e}")
 
     def _flush_csv_if_needed(self, now_ts):
         if not self.csv_buffer:
@@ -705,6 +852,39 @@ class MainWindow(QMainWindow):
                     print(f"[erro] fechar serial no closeEvent: {e}")
                 pass
         super().closeEvent(event)
+
+    # utilitário simples de log (arquivo) para debugging do mapa
+    def _log(self, msg: str):
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open("map_debug.log", "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {msg}\n")
+        except Exception:
+            pass
+
+    # callback para loadFinished do WebEngineView
+    def _on_map_load_finished(self, ok: bool):
+        try:
+            if ok:
+                self.status_label.setText("✅ Mapa carregado")
+                self._log("mapa.html carregado com sucesso no QWebEngineView")
+            else:
+                self.status_label.setText("❌ Erro ao carregar mapa")
+                self._log("falha ao carregar mapa.html no QWebEngineView")
+                # abre no navegador externo para ajudar no debug
+                try:
+                    import webbrowser
+                    webbrowser.open('file://' + os.path.abspath('mapa.html'))
+                    self._log("mapa.html aberto no navegador externo para debug")
+                except Exception as e:
+                    self._log(f"erro ao abrir navegador externo: {e}")
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] _on_map_load_finished: {e}")
+            try:
+                self._log(f"_on_map_load_finished exception: {e}")
+            except Exception:
+                pass
 
 
 # =========================
