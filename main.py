@@ -11,10 +11,10 @@ from folium import PolyLine
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QPushButton, QLabel, QHBoxLayout, QFrame, QComboBox
+    QPushButton, QLabel, QHBoxLayout, QFrame, QComboBox, QFileDialog, QSlider, QDialog, QTextBrowser, QCheckBox
 )
 from PySide6.QtCore import QTimer, QUrl, Qt, QRectF
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QLinearGradient, QBrush, QPen
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QLinearGradient, QBrush, QPen, QShortcut, QKeySequence
 from PySide6.QtWebEngineWidgets import QWebEngineView
 try:
     from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -27,6 +27,7 @@ import csv
 from pathlib import Path
 import re
 import json
+import xml.etree.ElementTree as ET
 
 # =========================
 # Configurações
@@ -48,6 +49,9 @@ LOG_ERRORS = False
 APP_TITLE = "🚛 Caminhão Autônomo - Painel de Controle"
 SPLASH_DEV_NAME = "Jefferson"
 SPLASH_PROJECT_NAME = "Caminhão Autônomo"
+
+# novo arquivo de configurações
+SETTINGS_FILE = "settings.json"
 
 _MAIN_WINDOW_REF = None
 
@@ -283,6 +287,70 @@ class SerialReader(threading.Thread):
                     print(f"[erro] leitura serial (thread): {e}")
                 time.sleep(0.1)
 
+class TutorialDialog(QDialog):
+    def __init__(self, parent=None, pages=None, show_on_start=True):
+        super().__init__(parent)
+        self.setWindowTitle("Tutorial — Como usar o programa")
+        self.resize(640, 420)
+        self.pages = pages or []
+        self.index = 0
+        self.show_on_start = bool(show_on_start)
+
+        layout = QVBoxLayout(self)
+        self.viewer = QTextBrowser(self)
+        self.viewer.setOpenExternalLinks(True)
+        layout.addWidget(self.viewer)
+
+        # checkbox para controlar se mostra ao iniciar
+        self.chk_start = QCheckBox("Mostrar tutorial na inicialização")
+        self.chk_start.setChecked(self.show_on_start)
+        layout.addWidget(self.chk_start)
+
+        btns = QHBoxLayout()
+        self.btn_prev = QPushButton("Anterior")
+        self.btn_prev.clicked.connect(self.on_prev)
+        self.btn_next = QPushButton("Próximo")
+        self.btn_next.clicked.connect(self.on_next)
+        self.btn_close = QPushButton("Fechar")
+        self.btn_close.clicked.connect(self._on_close)
+        btns.addWidget(self.btn_prev)
+        btns.addWidget(self.btn_next)
+        btns.addStretch()
+        btns.addWidget(self.btn_close)
+        layout.addLayout(btns)
+
+        self.update_view()
+
+    def update_view(self):
+        if not self.pages:
+            self.viewer.setHtml("<h3>Sem conteúdo</h3>")
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
+            return
+        content = self.pages[self.index]
+        footer = f"<p style='color:gray;font-size:11px'>Página {self.index+1} de {len(self.pages)}</p>"
+        self.viewer.setHtml(content + footer)
+        self.btn_prev.setEnabled(self.index > 0)
+        self.btn_next.setEnabled(self.index < len(self.pages) - 1)
+
+    def on_prev(self):
+        if self.index > 0:
+            self.index -= 1
+            self.update_view()
+
+    def on_next(self):
+        if self.index < len(self.pages) - 1:
+            self.index += 1
+            self.update_view()
+
+    def _on_close(self):
+        # atualiza flag e fecha (caller pode ler dlg.show_on_start)
+        try:
+            self.show_on_start = bool(self.chk_start.isChecked())
+        except Exception:
+            self.show_on_start = True
+        self.accept()
+
 class MainWindow(QMainWindow):
     def _file_url_with_ts(self, rel_path: str) -> QUrl:
         """Retorna QUrl file:/// absoluto com timestamp para evitar cache do WebEngineView."""
@@ -422,7 +490,20 @@ class MainWindow(QMainWindow):
         self.plot.setLabel('bottom', 'Tempo', units='s', color='#FFFFFF')
         self.speed_curve = self.plot.plot(pen=pg.mkPen('#00f7ff', width=2))
 
-        # Organização painel lateral
+        # controles adicionais: import/export GPX e playback
+        self.btn_export_gpx = QPushButton("Exportar GPX")
+        self.btn_export_gpx.clicked.connect(self.export_gpx)
+        self.btn_import_gpx = QPushButton("Importar GPX")
+        self.btn_import_gpx.clicked.connect(self.import_gpx)
+
+        self.btn_playback = QPushButton("Playback: OFF")
+        self.btn_playback.setCheckable(True)
+        self.btn_playback.clicked.connect(self.toggle_playback)
+        self.playback_speed_combo = QComboBox()
+        self.playback_speed_combo.addItems(["0.5x","1x","2x","4x"])
+        self.playback_speed_map = {"0.5x":2.0, "1x":1.0, "2x":0.5, "4x":0.25}  # multiplier -> interval factor
+
+        # organização painel lateral
         side.addWidget(title)
         side.addLayout(ports_row)
         side.addWidget(self.btn_connect)
@@ -439,6 +520,11 @@ class MainWindow(QMainWindow):
         side.addSpacing(8)
         side.addWidget(QLabel("Velocidade em tempo real"))
         side.addWidget(self.plot, stretch=1)
+        side.addWidget(self.btn_export_gpx)
+        side.addWidget(self.btn_import_gpx)
+        side.addWidget(self.btn_playback)
+        side.addWidget(QLabel("Velocidade playback"))
+        side.addWidget(self.playback_speed_combo)
         side.addStretch()
 
         # Painel do mapa
@@ -483,6 +569,25 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.webview.load(self._file_url_with_ts("mapa.html"))
+
+        # Inicializa fila de playback (uso interno)
+        self.playback_timer = QTimer()
+        self.playback_timer.timeout.connect(self._playback_tick)
+        self.playback_index = 0
+        self.playback_route = []
+
+        # Carrega configurações salvas (se houver)
+        try:
+            self.load_settings()
+        except Exception:
+            pass
+        # se configurado para mostrar tutorial ao iniciar, abre o diálogo (após load_settings)
+        try:
+            if getattr(self, "show_tutorial_on_start", True):
+                # mostre tutorial imediatamente
+                self.show_tutorial()
+        except Exception:
+            pass
 
         # Layout principal
         root.addLayout(side, 2)
@@ -867,6 +972,184 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    # Configurações: salvar/carregar
+    def load_settings(self):
+        try:
+            p = Path(SETTINGS_FILE)
+            if not p.exists():
+                return
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            # tema
+            theme = data.get("map_theme")
+            if theme and theme in ["voyager","positron","osm"]:
+                try:
+                    self.map_theme = theme
+                    self.theme_combo.setCurrentText(self.map_theme)
+                except Exception:
+                    pass
+            # porta (tenta selecionar se estiver na lista)
+            port = data.get("port")
+            if port:
+                # refresh ports if needed, then try to select matching entry
+                try:
+                    self.refresh_ports()
+                    for i in range(self.port_combo.count()):
+                        if port in self.port_combo.itemText(i):
+                            self.port_combo.setCurrentIndex(i)
+                            break
+                except Exception:
+                    pass
+            # tutorial on start (default True)
+            self.show_tutorial_on_start = bool(data.get("show_tutorial_on_start", True))
+        except Exception as e:
+            # garante flag presente mesmo em erro
+            try:
+                self.show_tutorial_on_start = True
+            except Exception:
+                pass
+            if LOG_ERRORS:
+                print(f"[erro] load_settings: {e}")
+
+    def save_settings(self):
+        try:
+            data = {
+                "map_theme": getattr(self, "map_theme", "voyager"),
+                "port": None,
+                "show_tutorial_on_start": getattr(self, "show_tutorial_on_start", True)
+            }
+            try:
+                text = self.port_combo.currentText()
+                if text and not text.startswith("("):
+                    data["port"] = text.split()[0]
+            except Exception:
+                pass
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] save_settings: {e}")
+
+    # GPX export/import
+    def export_gpx(self):
+        try:
+            if not self.route:
+                return
+            fn, _ = QFileDialog.getSaveFileName(self, "Salvar GPX", os.getcwd(), "GPX files (*.gpx)")
+            if not fn:
+                return
+            # escreve GPX simples com timestamps aproximados
+            gpx = ET.Element("gpx", version="1.1", creator="CaminhaoAutonomo")
+            trk = ET.SubElement(gpx, "trk")
+            name = ET.SubElement(trk, "name"); name.text = "rota_exportada"
+            trkseg = ET.SubElement(trk, "trkseg")
+            now = time.time()
+            # distribui timestamps por ordem (aprox 1s entre pontos)
+            for idx, (lat, lon) in enumerate(self.route):
+                trkpt = ET.SubElement(trkseg, "trkpt", lat=f"{lat:.6f}", lon=f"{lon:.6f}")
+                ts = ET.SubElement(trkpt, "time"); ts.text = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - (len(self.route)-idx)))
+            tree = ET.ElementTree(gpx)
+            tree.write(fn, encoding="utf-8", xml_declaration=True)
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] export_gpx: {e}")
+
+    def import_gpx(self):
+        try:
+            fn, _ = QFileDialog.getOpenFileName(self, "Abrir GPX", os.getcwd(), "GPX files (*.gpx)")
+            if not fn:
+                return
+            tree = ET.parse(fn)
+            root = tree.getroot()
+            ns = {}
+            # tenta detectar namespace
+            if root.tag.startswith("{"):
+                uri = root.tag.split("}")[0].strip("{")
+                ns = {"ns": uri}
+                trkpts = root.findall(".//ns:trkpt", ns)
+            else:
+                trkpts = root.findall(".//trkpt")
+            new_route = []
+            for pt in trkpts:
+                lat = float(pt.attrib.get("lat"))
+                lon = float(pt.attrib.get("lon"))
+                new_route.append((lat, lon))
+            if new_route:
+                # substitui rota atual e força refresh
+                self.route = deque(new_route, maxlen=ROUTE_MAX_POINTS)
+                try:
+                    # atualiza mapa dinamicamente se possível
+                    if not self._update_map_dynamic(new_route[-1][0], new_route[-1][1]):
+                        gerar_mapa(new_route[-1][0], new_route[-1][1], list(self.route), theme=self.map_theme)
+                        try:
+                            rewrite_map_html_offline("mapa.html")
+                        except Exception:
+                            pass
+                        self.webview.load(self._file_url_with_ts("mapa.html"))
+                except Exception:
+                    pass
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] import_gpx: {e}")
+
+    # Playback
+    def toggle_playback(self):
+        try:
+            self.playback_running = not getattr(self, "playback_running", False)
+            if self.playback_running:
+                # armazena rota atual para playback
+                self.playback_route = list(self.route)
+                if not self.playback_route:
+                    self.playback_running = False
+                    self.btn_playback.setChecked(False)
+                    return
+                self.playback_index = 0
+                # calcula intervalo base ~ 500ms ajustado pela speed multiplier
+                speed_label = self.playback_speed_combo.currentText()
+                factor = self.playback_speed_map.get(speed_label, 1.0)
+                interval = int(500 * factor)
+                self.playback_timer.start(interval)
+                self.btn_playback.setText("Playback: ON")
+            else:
+                self.playback_timer.stop()
+                self.btn_playback.setText("Playback: OFF")
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] toggle_playback: {e}")
+
+    def _playback_tick(self):
+        try:
+            if not self.playback_route or self.playback_index >= len(self.playback_route):
+                self.playback_timer.stop()
+                self.playback_running = False
+                self.btn_playback.setChecked(False)
+                self.btn_playback.setText("Playback: OFF")
+                return
+            lat, lon = self.playback_route[self.playback_index]
+            # atualiza labels e mapa (sem gravar CSV)
+            self.pos_label.setText(f"Lat: {lat:.5f} | Lon: {lon:.5f}")
+            # atualiza rota mostrada (mostramos prefixo até index)
+            subset = self.playback_route[:self.playback_index+1]
+            # tenta JS dinâmico
+            try:
+                js = f"try {{ updateData({lat:.6f}, {lon:.6f}, {json.dumps(subset)}); }} catch(e) {{ console.error('playback updateData error', e); }}"
+                self.webview.page().runJavaScript(js)
+            except Exception:
+                # fallback gera mapa
+                try:
+                    gerar_mapa(lat, lon, subset, theme=self.map_theme)
+                    try:
+                        rewrite_map_html_offline("mapa.html")
+                    except Exception:
+                        pass
+                    self.webview.load(self._file_url_with_ts("mapa.html"))
+                except Exception:
+                    pass
+            self.playback_index += 1
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] _playback_tick: {e}")
+
     # ----- Encerramento -----
     def closeEvent(self, event):
         # salvar rota final se habilitado
@@ -898,6 +1181,11 @@ class MainWindow(QMainWindow):
                 if LOG_ERRORS:
                     print(f"[erro] fechar serial no closeEvent: {e}")
                 pass
+        # salvar configurações
+        try:
+            self.save_settings()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # utilitário simples de log (arquivo) para debugging do mapa
