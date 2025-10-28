@@ -1,5 +1,6 @@
 {
   "map_theme": "voyager",
   "port": null,
-  "show_tutorial_on_start": true
+  "show_tutorial_on_start": true,
+  "assistant_enabled": true
 }

@@ -6,15 +6,15 @@ import threading
 import queue
 import serial
 import serial.tools.list_ports
-import folium
-from folium import PolyLine
+# folium / GPX removed
+# ET (xml) removed - GPX functionality removed
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QPushButton, QLabel, QHBoxLayout, QFrame, QComboBox, QFileDialog, QSlider, QDialog, QTextBrowser, QCheckBox
 )
 from PySide6.QtCore import QTimer, QUrl, Qt, QRectF
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QLinearGradient, QBrush, QPen, QShortcut, QKeySequence
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QLinearGradient, QBrush, QPen, QShortcut, QKeySequence, QPainterPath
 from PySide6.QtWebEngineWidgets import QWebEngineView
 try:
     from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -27,7 +27,6 @@ import csv
 from pathlib import Path
 import re
 import json
-import xml.etree.ElementTree as ET
 
 # =========================
 # Configurações
@@ -351,6 +350,160 @@ class TutorialDialog(QDialog):
             self.show_on_start = True
         self.accept()
 
+# --- Novo: Assistente "Clippy"-like ---
+from random import choice, randint
+
+class AssistantWidget(QWidget):
+    """Clippy-like widget: papel-clipe desenhado, dois olhos que piscam, balão de dica e arraste."""
+    def __init__(self, parent=None, tips=None):
+        super().__init__(parent, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(260, 140)
+        self._drag_pos = None
+
+        # balão de texto (usado para mostrar as dicas; mantém QLabel para fácil styling)
+        self.lbl = QLabel("", self)
+        self.lbl.setWordWrap(True)
+        self.lbl.setStyleSheet("color: white; background: rgba(0,0,0,200); border-radius: 8px; padding: 8px;")
+        self.lbl.setGeometry(10, 10, 180, 70)
+
+        # dicas atualizadas (sem referências a GPX)
+        self.tips = tips or [
+            "Olá! Posso ajudar com o painel do caminhão e rotas.",
+            "Clique em 'Iniciar simulação' para gerar trajetos fictícios.",
+            "Ative 'Salvar rota' para registrar pontos em CSV automaticamente.",
+            "Use 'Playback' para reproduzir uma rota gravada.",
+            "Altere o tema do mapa em 'voyager/positron/osm' para ver diferentes estilos."
+        ]
+
+        # atualiza dica periodicamente
+        self.tip_timer = QTimer(self)
+        self.tip_timer.timeout.connect(self._show_random_tip)
+        self.tip_timer.start(7000 + randint(0, 3000))
+        self._show_random_tip()
+
+        # botão para abrir tutorial (delegado ao MainWindow)
+        self.help_btn = QPushButton("Tutorial", self)
+        self.help_btn.setStyleSheet("padding:4px; font-size:11px;")
+        self.help_btn.setGeometry(150, 82, 90, 28)
+        self.help_btn.clicked.connect(self._open_tutorial)
+
+        # piscada dos olhos (curto blackout)
+        self.eyes_open = True
+        self.blink_interval = 3000 + randint(0, 2000)
+        self._start_blink_timer()
+
+        # leve oscilação vertical para dar vida
+        self._bob_phase = 0.0
+        self._bob_timer = QTimer(self)
+        self._bob_timer.timeout.connect(self._bob_tick)
+        self._bob_timer.start(60)
+
+    def _open_tutorial(self):
+        try:
+            w = self.parent()
+            if w and hasattr(w, "show_tutorial"):
+                w.show_tutorial()
+        except Exception:
+            pass
+
+    def _show_random_tip(self):
+        try:
+            self.lbl.setText(choice(self.tips))
+        except Exception:
+            pass
+
+    def _start_blink_timer(self):
+        # programa piscada periódica
+        self._blink_timer = QTimer(self)
+        self._blink_timer.setSingleShot(True)
+        self._blink_timer.timeout.connect(self._do_blink)
+        self._blink_timer.start(self.blink_interval)
+
+    def _do_blink(self):
+        self.eyes_open = False
+        self.update()
+        QTimer.singleShot(160, self._end_blink)
+
+    def _end_blink(self):
+        self.eyes_open = True
+        self.update()
+        # reinicia timer com pequena variação
+        self.blink_interval = 2500 + randint(0, 2500)
+        self._start_blink_timer()
+
+    def _bob_tick(self):
+        # simples animação de "bobbing"
+        self._bob_phase += 0.12
+        dy = int(math.sin(self._bob_phase) * 3)
+        self.move(self.x(), max(0, self.y() + dy))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # sombra leve
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 80))
+        p.drawRoundedRect(14, 78, 232, 48, 10, 10)
+
+        # desenha um "papel-clipe" estilizado usando path
+        path = QPainterPath()
+        # traço principal curvado (simples aproximação)
+        path.moveTo(40, 110)
+        path.cubicTo(40, 70, 110, 60, 140, 80)
+        path.cubicTo(170, 100, 170, 140, 110, 140)
+        pen = QPen(QColor(250, 250, 250), 6, cap=Qt.RoundCap, join=Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+
+        # detalhe interno para profundidade
+        inner_pen = QPen(QColor(200, 200, 200), 4, cap=Qt.RoundCap)
+        p.setPen(inner_pen)
+        inner_path = QPainterPath()
+        inner_path.moveTo(50, 112)
+        inner_path.cubicTo(50, 80, 115, 72, 138, 90)
+        p.drawPath(inner_path)
+
+        # olhos (dois) posicionados sobre o corpo
+        eye_cx = 98
+        eye_cy = 92
+        eye_sep = 18
+        eye_radius = 6
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255))
+        p.drawEllipse(eye_cx - eye_sep, eye_cy - 2, eye_radius*2, eye_radius*2)
+        p.drawEllipse(eye_cx + eye_sep - 6, eye_cy - 2, eye_radius*2, eye_radius*2)
+
+        # pupilas (abertas/fechadas)
+        p.setBrush(QColor(20, 20, 20))
+        if self.eyes_open:
+            p.drawEllipse(eye_cx - eye_sep + 4, eye_cy + 0, 6, 6)
+            p.drawEllipse(eye_cx + eye_sep - 2, eye_cy + 0, 6, 6)
+        else:
+            # traço horizontal para piscada
+            p.setPen(QPen(QColor(20, 20, 20), 3, cap=Qt.RoundCap))
+            p.drawLine(eye_cx - eye_sep + 3, eye_cy + 4, eye_cx - eye_sep + 11, eye_cy + 4)
+            p.drawLine(eye_cx + eye_sep - 1, eye_cy + 4, eye_cx + eye_sep + 7, eye_cy + 4)
+
+        p.end()
+
+    # arrastar com mouse
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        event.accept()
+
 class MainWindow(QMainWindow):
     def _file_url_with_ts(self, rel_path: str) -> QUrl:
         """Retorna QUrl file:/// absoluto com timestamp para evitar cache do WebEngineView."""
@@ -473,6 +626,15 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self.toggle_save)
         self.save_route = False
 
+        # --- Novo: botão Assistente ---
+        self.btn_assistant = QPushButton("Assistente: OFF")
+        self.btn_assistant.setCheckable(True)
+        self.btn_assistant.setChecked(False)
+        self.btn_assistant.clicked.connect(self.toggle_assistant)
+        self.assistant_enabled = False
+        # instancia do widget (será posicionada após criação da UI)
+        self.assistant = AssistantWidget(self)
+
         # Buffer de CSV
         self.csv_buffer = []  # lista de tuplas (lat, lon, t, spd)
         self.csv_last_flush = time.time()
@@ -490,11 +652,8 @@ class MainWindow(QMainWindow):
         self.plot.setLabel('bottom', 'Tempo', units='s', color='#FFFFFF')
         self.speed_curve = self.plot.plot(pen=pg.mkPen('#00f7ff', width=2))
 
-        # controles adicionais: import/export GPX e playback
-        self.btn_export_gpx = QPushButton("Exportar GPX")
-        self.btn_export_gpx.clicked.connect(self.export_gpx)
-        self.btn_import_gpx = QPushButton("Importar GPX")
-        self.btn_import_gpx.clicked.connect(self.import_gpx)
+        # controles adicionais: playback
+        # GPX export/import removed
 
         self.btn_playback = QPushButton("Playback: OFF")
         self.btn_playback.setCheckable(True)
@@ -512,6 +671,7 @@ class MainWindow(QMainWindow):
         side.addWidget(self.btn_follow)    # adiciona botão seguir mapa
         side.addWidget(self.btn_save)      # adiciona botão salvar rota
         side.addWidget(self.btn_logs)      # alternância de logs
+        side.addWidget(self.btn_assistant) # adiciona botão do assistente
         side.addSpacing(8)
         side.addWidget(self.status_label)
         side.addWidget(self.pos_label)
@@ -520,8 +680,7 @@ class MainWindow(QMainWindow):
         side.addSpacing(8)
         side.addWidget(QLabel("Velocidade em tempo real"))
         side.addWidget(self.plot, stretch=1)
-        side.addWidget(self.btn_export_gpx)
-        side.addWidget(self.btn_import_gpx)
+        # GPX buttons removed from UI
         side.addWidget(self.btn_playback)
         side.addWidget(QLabel("Velocidade playback"))
         side.addWidget(self.playback_speed_combo)
@@ -564,11 +723,13 @@ class MainWindow(QMainWindow):
 
         # gera e carrega mapa.html
         gerar_mapa(START_LAT, START_LON, [], theme=self.map_theme)
+        # posiciona assistente inicialmente (canto inferior esquerdo do mapa area)
         try:
-            rewrite_map_html_offline("mapa.html")
+            # posicao relativa ao webview (após layout aplicado pode necessitar ajuste)
+            self.assistant.move(420, 520)
+            self.assistant.hide()
         except Exception:
             pass
-        self.webview.load(self._file_url_with_ts("mapa.html"))
 
         # Inicializa fila de playback (uso interno)
         self.playback_timer = QTimer()
@@ -581,11 +742,13 @@ class MainWindow(QMainWindow):
             self.load_settings()
         except Exception:
             pass
-        # se configurado para mostrar tutorial ao iniciar, abre o diálogo (após load_settings)
+
+        # mostra assistente se configurado
         try:
-            if getattr(self, "show_tutorial_on_start", True):
-                # mostre tutorial imediatamente
-                self.show_tutorial()
+            if getattr(self, "assistant_enabled", False):
+                self.assistant.show()
+                self.btn_assistant.setChecked(True)
+                self.btn_assistant.setText("Assistente: ON")
         except Exception:
             pass
 
@@ -972,6 +1135,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ----- Assistente -----
+    def toggle_assistant(self):
+        try:
+            self.assistant_enabled = not getattr(self, "assistant_enabled", False)
+            if self.assistant_enabled:
+                self.assistant.show()
+                self.btn_assistant.setText("Assistente: ON")
+            else:
+                self.assistant.hide()
+                self.btn_assistant.setText("Assistente: OFF")
+        except Exception as e:
+            if LOG_ERRORS:
+                print(f"[erro] toggle_assistant: {e}")
+
     # Configurações: salvar/carregar
     def load_settings(self):
         try:
@@ -1002,10 +1179,13 @@ class MainWindow(QMainWindow):
                     pass
             # tutorial on start (default True)
             self.show_tutorial_on_start = bool(data.get("show_tutorial_on_start", True))
+            # assistente (novo)
+            self.assistant_enabled = bool(data.get("assistant_enabled", False))
         except Exception as e:
             # garante flag presente mesmo em erro
             try:
                 self.show_tutorial_on_start = True
+                self.assistant_enabled = False
             except Exception:
                 pass
             if LOG_ERRORS:
@@ -1016,7 +1196,8 @@ class MainWindow(QMainWindow):
             data = {
                 "map_theme": getattr(self, "map_theme", "voyager"),
                 "port": None,
-                "show_tutorial_on_start": getattr(self, "show_tutorial_on_start", True)
+                "show_tutorial_on_start": getattr(self, "show_tutorial_on_start", True),
+                "assistant_enabled": getattr(self, "assistant_enabled", False)
             }
             try:
                 text = self.port_combo.currentText()
@@ -1030,67 +1211,7 @@ class MainWindow(QMainWindow):
             if LOG_ERRORS:
                 print(f"[erro] save_settings: {e}")
 
-    # GPX export/import
-    def export_gpx(self):
-        try:
-            if not self.route:
-                return
-            fn, _ = QFileDialog.getSaveFileName(self, "Salvar GPX", os.getcwd(), "GPX files (*.gpx)")
-            if not fn:
-                return
-            # escreve GPX simples com timestamps aproximados
-            gpx = ET.Element("gpx", version="1.1", creator="CaminhaoAutonomo")
-            trk = ET.SubElement(gpx, "trk")
-            name = ET.SubElement(trk, "name"); name.text = "rota_exportada"
-            trkseg = ET.SubElement(trk, "trkseg")
-            now = time.time()
-            # distribui timestamps por ordem (aprox 1s entre pontos)
-            for idx, (lat, lon) in enumerate(self.route):
-                trkpt = ET.SubElement(trkseg, "trkpt", lat=f"{lat:.6f}", lon=f"{lon:.6f}")
-                ts = ET.SubElement(trkpt, "time"); ts.text = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - (len(self.route)-idx)))
-            tree = ET.ElementTree(gpx)
-            tree.write(fn, encoding="utf-8", xml_declaration=True)
-        except Exception as e:
-            if LOG_ERRORS:
-                print(f"[erro] export_gpx: {e}")
-
-    def import_gpx(self):
-        try:
-            fn, _ = QFileDialog.getOpenFileName(self, "Abrir GPX", os.getcwd(), "GPX files (*.gpx)")
-            if not fn:
-                return
-            tree = ET.parse(fn)
-            root = tree.getroot()
-            ns = {}
-            # tenta detectar namespace
-            if root.tag.startswith("{"):
-                uri = root.tag.split("}")[0].strip("{")
-                ns = {"ns": uri}
-                trkpts = root.findall(".//ns:trkpt", ns)
-            else:
-                trkpts = root.findall(".//trkpt")
-            new_route = []
-            for pt in trkpts:
-                lat = float(pt.attrib.get("lat"))
-                lon = float(pt.attrib.get("lon"))
-                new_route.append((lat, lon))
-            if new_route:
-                # substitui rota atual e força refresh
-                self.route = deque(new_route, maxlen=ROUTE_MAX_POINTS)
-                try:
-                    # atualiza mapa dinamicamente se possível
-                    if not self._update_map_dynamic(new_route[-1][0], new_route[-1][1]):
-                        gerar_mapa(new_route[-1][0], new_route[-1][1], list(self.route), theme=self.map_theme)
-                        try:
-                            rewrite_map_html_offline("mapa.html")
-                        except Exception:
-                            pass
-                        self.webview.load(self._file_url_with_ts("mapa.html"))
-                except Exception:
-                    pass
-        except Exception as e:
-            if LOG_ERRORS:
-                print(f"[erro] import_gpx: {e}")
+    # GPX functionality removed.
 
     # Playback
     def toggle_playback(self):
